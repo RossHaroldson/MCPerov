@@ -19,7 +19,7 @@ a0   = 5.2917706e-11;   % Bohr radius (m)
 a = 6.017e-10;          % lattice constant for cubic CsPbBr3 in meters
 disp('Constants loaded');
 %% Params
-T=300;
+T=77;
 Egap = 2.1*e;
 Ef = 1*e;
 a=6.3e-10;                                          % lattice constant for cspbbr3
@@ -62,9 +62,12 @@ for j = 1:length(n_D)
     for i = 1:size(kvector,1)
         scat_BH(i,j) = P_BH(kvector(i,:),1,m_e,n_D(j),q_scr);
         E_e(i) = Ekin(kvector(i,:),m_e);
-        P_H_phonons(:,i) = Prob_Hop(E_DB,F,lat,E_th,0,0,Z_imp,carrier);
-        P_H_carriers(:,i) = Prob_Hop(E_DB,F,lat,0,kvector(i,:),m_e,Z_imp,carrier);
-        P_H_3body(:,i) = Prob_Hop(E_DB,F,lat,E_th,kvector(i,:),m_e,Z_imp,carrier);
+        % calculate the probablity a impurity will hop in 6 direction for
+        % each k vector and impurit density. Phonons are with thermal
+        % energy kT, k vector, and mass of electron.
+        P_H_phonons(:,i)    = Prob_Hop(E_DB,F,lat,E_th,0,0,Z_imp,carrier); % for phonon causing a hop
+        P_H_carriers(:,i)   = Prob_Hop(E_DB,F,lat,0,kvector(i,:),m_e,Z_imp,carrier); % for a electron or hole directly hitting an impurity to cause a hop
+        P_H_3body(:,i)      = Prob_Hop(E_DB,F,lat,E_th,kvector(i,:),m_e,Z_imp,carrier);% for a electron/hole plus a phonon to cause an impurity to hop
     end
     plot(E_e/e,scat_BH(:,j),'linewidth',2);
 end
@@ -72,12 +75,12 @@ hold off;set(gca, 'YScale', 'log')
 title('Electron-Impurity Scattering Rates with screening'); xlabel('Energy of electron (eV)');
 ylabel('Scattering Rate (seconds^{-1})');
 % plot hop probabilities
-% figure; plot(E_e/e, P_H_carriers,'linewidth',2)
-% figure; plot(E_e/e, P_H_phonons,'linewidth',2)
-% figure; plot(E_e/e, P_H_3body,'linewidth',2)
-figure; plot(E_e/e, P_H_carriers,E_e/e, P_H_phonons,E_e/e, P_H_3body,'linewidth',2)
-title('Hopping probabilities models'); xlabel('Energy of carrier (eV)');
-ylabel('Probability of a impurity hop');
+ figure; plot(E_e/e, P_H_carriers,'linewidth',2);xlabel('Energy of carrier (eV)');ylabel('Probability of a impurity hop');title('Carriers');
+ figure; plot(E_e/e, P_H_phonons,'linewidth',2);xlabel('Energy of carrier (eV)');ylabel('Probability of a impurity hop');title('Phonons');
+ figure; plot(E_e/e, P_H_3body,'linewidth',2);xlabel('Energy of carrier (eV)');ylabel('Probability of a impurity hop');title('Phonon + Carrier Hop');
+% figure; plot(E_e/e, P_H_carriers,E_e/e, P_H_phonons,E_e/e, P_H_3body,'linewidth',2)
+% title('Hopping probabilities models'); xlabel('Energy of carrier (eV)');
+% ylabel('Probability of a impurity hop');legend('Carriers','Phonons','3-Body')
 % the hopping rate doesn't seem to be as directional as one would think.
 % maybe the denominator that includes the carriers k vector should include
 % a dot product to the unit lattice vectors. However, 
@@ -106,7 +109,7 @@ figure; semilogy(E_e/e, hop_BH_3body,'linewidth',2)
 title('Hopping rates from one electron with 3 body energy hopping model'); xlabel('Energy of carrier (eV)');
 ylabel('Hopping Rate (1/s)');
 figure; semilogy(E_e/e, hop_debye_phonons,'linewidth',2)
-title('Hopping rates with debye-phonon model no scattering'); xlabel('Energy of carrier (eV)');
+title('Hopping rates with debye-phonon model no electron scattering'); xlabel('Energy of carrier (eV)');
 ylabel('Hopping Rate (1/s)');
 % Note that the hopping rate by the normal debye phonon model is 10^11 Hz
 % while the scatter-hop rates are at 10^-11 1/s

@@ -20,7 +20,7 @@ bx = RHS;
 bx(end) = bx(end) + alpha*params.Vbias*params.q;
 V = poismatrix \ bx';
 psi = V./params.q;
-Efield = Efield_solver(psi, params.dx);
+Efield = solveEfield(psi, params.dx);
 t = 1;
 disp('Initial potential and field solved');
 
@@ -34,10 +34,10 @@ while t <= params.Ntime
     checkDt(particles, params);
     
     % Update potential & field using GPU-based density estimation
-    rho = (cloudincell_gpu2(particles.r_h, params.realspace) - cloudincell_gpu2(particles.r_e, params.realspace)) * params.q;
-    V = poisson_solver(poismatrix, params.q/params.eps * rho, params.Vbias);
+    rho = (cloudincell_gpu(particles.r_h, params.realspace) - cloudincell_gpu(particles.r_e, params.realspace)) * params.q;
+    V = solvePoisson(poismatrix, params.q/params.eps * rho, params.Vbias);
     observables.Psi(:,t) = V/params.q;
-    observables.Efield(:,t) = Efield_solver(observables.Psi(:,t), params.dx);
+    observables.Efield(:,t) = solveEfield(observables.Psi(:,t), params.dx);
     
     % Update scattering rates and prepare GPU arrays
     [particles, scatRates, gpu_Efield_e, gpu_Efield_h, gpu_rand_e, gpu_rand_h] = updateScattering(particles, params, Efield);
@@ -139,6 +139,20 @@ function params = initParameters()
     params.prob_dist_e = density_factor*(params.m_e*params.m_0)^(3/2)*sqrt(Ep-params.Egap) ./ (1+exp((Ep-params.Ef)/(params.kb*params.T)));
     params.prob_dist_h = density_factor*(params.m_h*params.m_0)^(3/2)*sqrt(Ep-params.Egap) ./ (1+exp((Ep-params.Ef)/(params.kb*params.T)));
     params.Ep = Ep;
+
+    % --- Impurity Scattering Parameters (Work in Progress) ---
+    params.eps_rel_stat = 32.3;  % static dielectric constant (for impurity screening)
+    params.impurity.E_DB = 0.1 * params.q;  % diffusion barrier energy (J)
+    params.impurity.F = [params.Vbias / params.device_thickness / params.eps_rel_stat, 0, 0]; % effective field (V/m)
+    params.impurity.lat = [ params.a,  0,  0;
+                           -params.a,  0,  0;
+                            0, params.a,  0;
+                            0,-params.a,  0;
+                            0,  0, params.a;
+                            0,  0,-params.a];  % nearest-neighbor lattice vectors
+    params.impurity.E_th = params.kb * params.T;  % thermal energy (J)
+    params.impurity.Z = -1;  % ionization state of the defect
+    params.impurity.useImpurity = true;  % flag to enable impurity scattering
 end
 
 function [particles, energyStruct] = initParticles(params)
@@ -217,36 +231,149 @@ function [r_new, k_new, into_Cu, into_ITO] = updateParticles_gpu(type, r, k, par
     else
         signVal = 1; m_val = params.m_h;
     end
-    del_t_eh = params.del_t_eh;  device_thickness = params.device_thickness;
-    [r_new, kx_new, ky_new, kz_new, into_Cu, into_ITO] = arrayfun(@carrierLoopV1, ...
+    del_t_eh = params.del_t_eh;
+    device_thickness = params.device_thickness;
+    
+    % Unpack impurity parameters from params.impurity
+    useImpurity = double(params.impurity.useImpurity);
+    E_DB = params.impurity.E_DB;
+    % F vector (1x3)
+    F1 = params.impurity.F(1); F2 = params.impurity.F(2); F3 = params.impurity.F(3);
+    % Lattice vectors (6x3) unpacked rowwise
+    lat11 = params.impurity.lat(1,1); lat12 = params.impurity.lat(1,2); lat13 = params.impurity.lat(1,3);
+    lat21 = params.impurity.lat(2,1); lat22 = params.impurity.lat(2,2); lat23 = params.impurity.lat(2,3);
+    lat31 = params.impurity.lat(3,1); lat32 = params.impurity.lat(3,2); lat33 = params.impurity.lat(3,3);
+    lat41 = params.impurity.lat(4,1); lat42 = params.impurity.lat(4,2); lat43 = params.impurity.lat(4,3);
+    lat51 = params.impurity.lat(5,1); lat52 = params.impurity.lat(5,2); lat53 = params.impurity.lat(5,3);
+    lat61 = params.impurity.lat(6,1); lat62 = params.impurity.lat(6,2); lat63 = params.impurity.lat(6,3);
+    E_th_imp = params.impurity.E_th;
+    Z_imp = params.impurity.Z;
+    
+    [r_new, kx_new, ky_new, kz_new, into_Cu, into_ITO] = arrayfun(@carrierLoop, ...
         gpuArray(r), gpuArray(k(:,1)), gpuArray(k(:,2)), gpuArray(k(:,3)), ...
-        m_val, del_t_eh, gpuArray(scatter), device_thickness, gpu_Efield, gpu_rand, signVal);
+        m_val, del_t_eh, gpuArray(scatter), device_thickness, gpu_Efield, gpu_rand, signVal, ...
+        useImpurity, E_DB, F1, F2, F3, ...
+        lat11, lat12, lat13, lat21, lat22, lat23, lat31, lat32, lat33, ...
+        lat41, lat42, lat43, lat51, lat52, lat53, lat61, lat62, lat63, ...
+        E_th_imp, Z_imp);
+    
     r_new = gather(r_new);
     k_new = [gather(kx_new) gather(ky_new) gather(kz_new)];
 end
 
-function [r, kx, ky, kz, into_Cu, into_ITO] = carrierLoopV1(r_val, kx, ky, kz, m_val, dt, scatter, device_thickness, Efield_int, r_rand, signVal)
-    m0 = 9.109534e-31; hbar = 1.0545887e-34; q = 1.6021892e-19;
-    into_Cu = 0; into_ITO = 0;
+
+function [r, kx, ky, kz, into_Cu, into_ITO] = carrierLoop(...
+    r_val, kx, ky, kz, m_val, dt, scatter, device_thickness, Efield_int, r_rand, signVal, ...
+    useImpurity, E_DB, F1, F2, F3, ...
+    lat11, lat12, lat13, lat21, lat22, lat23, lat31, lat32, lat33, ...
+    lat41, lat42, lat43, lat51, lat52, lat53, lat61, lat62, lat63, ...
+    E_th_imp, Z_imp)
+    
+    % Physical constants
+    m0 = 9.109534e-31;
+    hbar = 1.0545887e-34;
+    q = 1.6021892e-19;
+    into_Cu = 0;
+    into_ITO = 0;
+    
     if dt * scatter > r_rand
-        vecnorm = sqrt(kx^2 + ky^2 + kz^2);
-        r1 = 2*rand() - 1; r2 = 2*rand() - 1; r3 = 2*rand() - 1;
-        rnd_norm = sqrt(r1^2 + r2^2 + r3^2);  if rnd_norm == 0, rnd_norm = 1; end
-        r1 = r1 / rnd_norm; r2 = r2 / rnd_norm; r3 = r3 / rnd_norm;
-        kx = r1 * vecnorm;
-        ky = r2 * vecnorm;
-        kz = r3 * vecnorm + signVal*(q/hbar * Efield_int * dt);
-        r = r_val + hbar*kz/(m_val*m0)*dt + signVal*(q/hbar * Efield_int * dt^2);
+        if useImpurity > 0
+            % Impurity scattering branch
+            % Compute Boltzmann factors for each of the 6 lattice directions:
+            % For lattice vector 1:
+            a_norm1 = sqrt(lat11^2 + lat12^2 + lat13^2);
+            F_dot_a1 = F1*lat11 + F2*lat12 + F3*lat13;
+            proj1 = abs(q*(kx*lat11 + ky*lat12 + kz*lat13)/a_norm1);
+            B1 = exp( -(E_DB - Z_imp*q*F_dot_a1/2) / (E_th_imp + (hbar^2 * proj1^2)/(2*m_val*m0)) );
+            % For lattice vector 2:
+            a_norm2 = sqrt(lat21^2 + lat22^2 + lat23^2);
+            F_dot_a2 = F1*lat21 + F2*lat22 + F3*lat23;
+            proj2 = abs(q*(kx*lat21 + ky*lat22 + kz*lat23)/a_norm2);
+            B2 = exp( -(E_DB - Z_imp*q*F_dot_a2/2) / (E_th_imp + (hbar^2 * proj2^2)/(2*m_val*m0)) );
+            % For lattice vector 3:
+            a_norm3 = sqrt(lat31^2 + lat32^2 + lat33^2);
+            F_dot_a3 = F1*lat31 + F2*lat32 + F3*lat33;
+            proj3 = abs(q*(kx*lat31 + ky*lat32 + kz*lat33)/a_norm3);
+            B3 = exp( -(E_DB - Z_imp*q*F_dot_a3/2) / (E_th_imp + (hbar^2 * proj3^2)/(2*m_val*m0)) );
+            % For lattice vector 4:
+            a_norm4 = sqrt(lat41^2 + lat42^2 + lat43^2);
+            F_dot_a4 = F1*lat41 + F2*lat42 + F3*lat43;
+            proj4 = abs(q*(kx*lat41 + ky*lat42 + kz*lat43)/a_norm4);
+            B4 = exp( -(E_DB - Z_imp*q*F_dot_a4/2) / (E_th_imp + (hbar^2 * proj4^2)/(2*m_val*m0)) );
+            % For lattice vector 5:
+            a_norm5 = sqrt(lat51^2 + lat52^2 + lat53^2);
+            F_dot_a5 = F1*lat51 + F2*lat52 + F3*lat53;
+            proj5 = abs(q*(kx*lat51 + ky*lat52 + kz*lat53)/a_norm5);
+            B5 = exp( -(E_DB - Z_imp*q*F_dot_a5/2) / (E_th_imp + (hbar^2 * proj5^2)/(2*m_val*m0)) );
+            % For lattice vector 6:
+            a_norm6 = sqrt(lat61^2 + lat62^2 + lat63^2);
+            F_dot_a6 = F1*lat61 + F2*lat62 + F3*lat63;
+            proj6 = abs(q*(kx*lat61 + ky*lat62 + kz*lat63)/a_norm6);
+            B6 = exp( -(E_DB - Z_imp*q*F_dot_a6/2) / (E_th_imp + (hbar^2 * proj6^2)/(2*m_val*m0)) );
+            
+            % Sum base term (1) and all Boltzmann factors
+            Z_h = 1 + B1 + B2 + B3 + B4 + B5 + B6;
+            % Normalize probabilities
+            P1 = B1 / Z_h;
+            P2 = B2 / Z_h;
+            P3 = B3 / Z_h;
+            P4 = B4 / Z_h;
+            P5 = B5 / Z_h;
+            P6 = B6 / Z_h;
+            % Choose the lattice direction with the maximum probability
+            maxP = P1; idx = 1;
+            if P2 > maxP, maxP = P2; idx = 2; end
+            if P3 > maxP, maxP = P3; idx = 3; end
+            if P4 > maxP, maxP = P4; idx = 4; end
+            if P5 > maxP, maxP = P5; idx = 5; end
+            if P6 > maxP, maxP = P6; idx = 6; end
+            
+            % Set new k-vector direction based on chosen lattice vector
+            if idx == 1
+                new_kx = lat11; new_ky = lat12; new_kz = lat13;
+            elseif idx == 2
+                new_kx = lat21; new_ky = lat22; new_kz = lat23;
+            elseif idx == 3
+                new_kx = lat31; new_ky = lat32; new_kz = lat33;
+            elseif idx == 4
+                new_kx = lat41; new_ky = lat42; new_kz = lat43;
+            elseif idx == 5
+                new_kx = lat51; new_ky = lat52; new_kz = lat53;
+            else
+                new_kx = lat61; new_ky = lat62; new_kz = lat63;
+            end
+            
+            current_norm = sqrt(kx^2 + ky^2 + kz^2);
+            kx = new_kx * current_norm;
+            ky = new_ky * current_norm;
+            kz = new_kz * current_norm;
+            r = r_val + hbar*kz/(m_val*m0)*dt + signVal*(q/hbar * Efield_int * dt^2);
+        else
+            % Regular collision event (no impurity scattering)
+            vecnorm = sqrt(kx^2 + ky^2 + kz^2);
+            r1 = 2*rand() - 1; r2 = 2*rand() - 1; r3 = 2*rand() - 1;
+            rnd_norm = sqrt(r1^2 + r2^2 + r3^2); if rnd_norm == 0, rnd_norm = 1; end
+            r1 = r1 / rnd_norm; r2 = r2 / rnd_norm; r3 = r3 / rnd_norm;
+            kx = r1 * vecnorm;
+            ky = r2 * vecnorm;
+            kz = r3 * vecnorm + signVal*(q/hbar * Efield_int * dt);
+            r = r_val + hbar*kz/(m_val*m0)*dt + signVal*(q/hbar * Efield_int * dt^2);
+        end
     else
+        % Free flight update
         kz = kz + signVal*(q/hbar * Efield_int * dt);
         r = r_val + hbar*kz/(m_val*m0)*dt + signVal*(q/hbar * Efield_int * dt^2);
     end
+    
+    % Boundary conditions: mark carriers out of bounds
     if r > device_thickness
-         r = NaN; kx = NaN; ky = NaN; kz = NaN;  into_Cu = 1;
+         r = NaN; kx = NaN; ky = NaN; kz = NaN; into_Cu = 1;
     elseif r < 0
-         r = NaN; kx = NaN; ky = NaN; kz = NaN;  into_ITO = 1;
+         r = NaN; kx = NaN; ky = NaN; kz = NaN; into_ITO = 1;
     end
 end
+
+
 
 function [r, k] = removeNaNParticles(r, k)
     valid = ~isnan(r);
@@ -374,7 +501,7 @@ function density = cloudincell(dist, xaxis, weight)
     density = density.';
 end
 
-function density = cloudincell_gpu2(dist, xaxis, weight)
+function density = cloudincell_gpu(dist, xaxis, weight)
     if nargin < 3, weight = ones(size(dist), 'like', dist); end
     dist = gpuArray(dist(:)); xaxis = gpuArray(xaxis(:)); weight = gpuArray(weight(:));
     if isempty(dist)
@@ -455,7 +582,7 @@ function [qFn, qFp] = quasifermifind(e_density, h_density, m_e, m_h, Egap)
     qFn = ec; qFp = hc;
 end
 
-function Efield = Efield_solver(psi, dx)
+function Efield = solveEfield(psi, dx)
     n = length(psi);
     Efield = zeros(n,1);
     Efield(1) = (-3*psi(1)+4*psi(2)-psi(3))/(2*dx);
@@ -467,7 +594,7 @@ function Efield = Efield_solver(psi, dx)
     end
 end
 
-function V = poisson_solver(M, RHS, Vbias)
+function V = solvePoisson(M, RHS, Vbias)
     q = 1.6021892e-19; n = length(RHS);
     bx = RHS;
     bx(1) = RHS(1);
